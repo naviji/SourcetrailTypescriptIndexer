@@ -341,6 +341,8 @@ export class Indexing {
   private host: ts.CompilerHost;
   private diagnostics: readonly ts.Diagnostic[];
   private projectDirectory: string;
+  /** Folders above the indexed files, e.g. `["src"]`. Recorded as namespaces so Sourcetrail draws each file on its own. */
+  private packageParts: string[];
   private writer!: SourcetrailDB;
   /** One Sourcetrail symbol per declaration node, so definitions and references share it. */
   private symbols = new Map<ts.Node, SymbolBuilder>();
@@ -364,7 +366,23 @@ export class Indexing {
     this.diagnostics = ts.getPreEmitDiagnostics(this.program);
     // Names are relative to the project root (nearest package.json above the indexed files), so they do not depend
     // on where the index is written and start at e.g. `src/...`.
-    this.projectDirectory = projectRoot(commonDirectory(fileNames));
+    const indexedDirectory = commonDirectory(fileNames);
+    this.projectDirectory = projectRoot(indexedDirectory);
+    this.packageParts = path
+      .relative(this.projectDirectory, indexedDirectory)
+      .split(path.sep)
+      .filter(part => part.length > 0);
+  }
+
+  /**
+   * Records the folders above the indexed files as namespaces. Sourcetrail treats a namespace as transparent: each
+   * file below it becomes a top-level node, so dependencies between files are drawn between those files rather than
+   * as loops inside one shared `src` box. Namespaces have no edges of their own when activated.
+   */
+  private recordPackageParts(writer: SourcetrailDB): void {
+    if (this.packageParts.length > 0) {
+      writer.createSymbol(NAME_DELIMITER, this.packageParts).ofType(SymbolKind.NAMESPACE);
+    }
   }
 
   private addOrGetFile(
@@ -672,6 +690,7 @@ export class Indexing {
       writer => {
         indexer.writer = writer;
         indexer.addDiagnostics(writer);
+        indexer.recordPackageParts(writer);
         indexer.program
           .getSourceFiles()
           .filter(sf => !indexer.isExternal(sf))
