@@ -320,6 +320,20 @@ function commonDirectory(files: readonly string[]): string {
   return common.join(path.sep) || path.sep;
 }
 
+/**
+ * The project root: the nearest directory, starting at `start` and walking up, that holds a `package.json`.
+ * For `/p/src/a/x.ts` this is `/p`, so names start at `src/...`. Falls back to `start` when there is none.
+ */
+function projectRoot(start: string): string {
+  let dir = start;
+  for (;;) {
+    if (ts.sys.fileExists(path.join(dir, "package.json"))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return start;
+    dir = parent;
+  }
+}
+
 export class Indexing {
   private fileIds = new Map<string, FileBuilder>();
   private program: ts.Program;
@@ -348,8 +362,9 @@ export class Indexing {
     this.program = ts.createProgram(programOptions);
     this.checker = this.program.getTypeChecker();
     this.diagnostics = ts.getPreEmitDiagnostics(this.program);
-    // Names are relative to the indexed files' common directory, so they do not depend on where the index is written.
-    this.projectDirectory = commonDirectory(fileNames);
+    // Names are relative to the project root (nearest package.json above the indexed files), so they do not depend
+    // on where the index is written and start at e.g. `src/...`.
+    this.projectDirectory = projectRoot(commonDirectory(fileNames));
   }
 
   private addOrGetFile(
@@ -411,11 +426,16 @@ export class Indexing {
     });
   }
 
+  /**
+   * One symbol per file, named by its path. Not SymbolKind.MODULE: Sourcetrail treats module nodes as packages and
+   * draws only their children, so a file's imports and usages would not show. TYPE is a big node that is not a
+   * package, so the file's members and outgoing edges draw.
+   */
   private moduleSymbol(sf: ts.SourceFile, file: FileBuilder): SymbolBuilder {
     return this.writer
       .createSymbol(NAME_DELIMITER, this.fileNameParts(sf))
       .explicitly()
-      .ofType(SymbolKind.MODULE)
+      .ofType(SymbolKind.TYPE)
       .withScope(nodeToSourceRange(sf, file));
   }
 
