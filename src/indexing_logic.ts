@@ -341,8 +341,6 @@ export class Indexing {
   private host: ts.CompilerHost;
   private diagnostics: readonly ts.Diagnostic[];
   private projectDirectory: string;
-  /** Folders above the indexed files, e.g. `["src"]`. Recorded as namespaces so Sourcetrail draws each file on its own. */
-  private packageParts: string[];
   private writer!: SourcetrailDB;
   /** One Sourcetrail symbol per declaration node, so definitions and references share it. */
   private symbols = new Map<ts.Node, SymbolBuilder>();
@@ -366,22 +364,27 @@ export class Indexing {
     this.diagnostics = ts.getPreEmitDiagnostics(this.program);
     // Names are relative to the project root (nearest package.json above the indexed files), so they do not depend
     // on where the index is written and start at e.g. `src/...`.
-    const indexedDirectory = commonDirectory(fileNames);
-    this.projectDirectory = projectRoot(indexedDirectory);
-    this.packageParts = path
-      .relative(this.projectDirectory, indexedDirectory)
-      .split(path.sep)
-      .filter(part => part.length > 0);
+    this.projectDirectory = projectRoot(commonDirectory(fileNames));
   }
 
   /**
-   * Records the folders above the indexed files as namespaces. Sourcetrail treats a namespace as transparent: each
-   * file below it becomes a top-level node, so dependencies between files are drawn between those files rather than
-   * as loops inside one shared `src` box. Namespaces have no edges of their own when activated.
+   * Records every folder above an indexed file as a namespace. Sourcetrail treats a namespace as transparent, so each
+   * file is a top-level node and its dependencies draw between files. A folder with no record is an implicit parent
+   * with no definition, which Sourcetrail bundles as "Non-indexed Symbols" and hides its callers behind.
+   * Namespaces have no edges of their own when activated.
    */
-  private recordPackageParts(writer: SourcetrailDB): void {
-    if (this.packageParts.length > 0) {
-      writer.createSymbol(NAME_DELIMITER, this.packageParts).ofType(SymbolKind.NAMESPACE);
+  private recordFolders(writer: SourcetrailDB): void {
+    const folders = new Map<string, string[]>();
+    for (const sf of this.program.getSourceFiles()) {
+      if (this.isExternal(sf)) continue;
+      const parts = this.fileNameParts(sf);
+      for (let depth = 1; depth < parts.length; depth++) {
+        const folder = parts.slice(0, depth);
+        folders.set(folder.join(NAME_DELIMITER), folder);
+      }
+    }
+    for (const folder of folders.values()) {
+      writer.createSymbol(NAME_DELIMITER, folder).ofType(SymbolKind.NAMESPACE);
     }
   }
 
@@ -690,7 +693,7 @@ export class Indexing {
       writer => {
         indexer.writer = writer;
         indexer.addDiagnostics(writer);
-        indexer.recordPackageParts(writer);
+        indexer.recordFolders(writer);
         indexer.program
           .getSourceFiles()
           .filter(sf => !indexer.isExternal(sf))
