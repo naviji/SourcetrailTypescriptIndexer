@@ -1,7 +1,10 @@
 import * as ts from "typescript";
+import * as fs from "fs";
+import { DatabaseSync } from "node:sqlite";
 import SourcetrailDB, {
   FileBuilder,
   ReferenceKind,
+  SymbolBuilder,
   SymbolKind
 } from "sourcetraildb/dist/builder";
 
@@ -10,6 +13,19 @@ import { normalizePath, combinePaths } from "./util/path";
 
 // The following is only partially written and heavily inspired by https://github.com/Microsoft/TypeScript/wiki/Using-the-Compiler-API#a-minimal-compiler
 // and https://github.com/microsoft/TypeScript/blob/38652d4cd7edcdc84580a09dd5e9b304f62a2f2b/scripts/buildProtocol.ts
+
+/** Separates the elements of a Sourcetrail name hierarchy: file path parts, then the declaration's names. */
+const NAME_DELIMITER = "/";
+
+/**
+ * Sourcetrail reads the project settings it stored in the database and compares them with the `.srctrlprj` file.
+ * If they differ, it asks to reindex. The indexer therefore writes the same text to both places.
+ */
+const DEFAULT_PROJECT_SETTINGS = `<?xml version="1.0" encoding="utf-8" ?>
+<config>
+    <version>8</version>
+</config>
+`;
 
 function isStringEnum(declaration: ts.EnumDeclaration) {
   return (
@@ -75,16 +91,6 @@ function nodeToSourceRange(node: ts.Node, file: FileBuilder) {
     .getSourceFile()
     .getLineAndCharacterOfPosition(node.getStart());
   const end = node.getSourceFile().getLineAndCharacterOfPosition(node.getEnd());
-  return toSourceRange(file, start, end);
-}
-
-function libReferenceToSourceRange(
-  ref: ts.FileReference,
-  sf: ts.SourceFile,
-  file: FileBuilder
-) {
-  const start = sf.getLineAndCharacterOfPosition(ref.pos);
-  const end = sf.getLineAndCharacterOfPosition(ref.end);
   return toSourceRange(file, start, end);
 }
 
@@ -162,11 +168,171 @@ function recordAtomicSourceRangesForMultilineComments(
   }
 }
 
+/** Declarations that have a name Sourcetrail can index. Anything else is skipped as a name. */
+const NAMED_DECLARATION_KINDS = new Set<ts.SyntaxKind>([
+  ts.SyntaxKind.ClassDeclaration,
+  ts.SyntaxKind.InterfaceDeclaration,
+  ts.SyntaxKind.EnumDeclaration,
+  ts.SyntaxKind.EnumMember,
+  ts.SyntaxKind.FunctionDeclaration,
+  ts.SyntaxKind.MethodDeclaration,
+  ts.SyntaxKind.MethodSignature,
+  ts.SyntaxKind.Constructor,
+  ts.SyntaxKind.GetAccessor,
+  ts.SyntaxKind.SetAccessor,
+  ts.SyntaxKind.PropertyDeclaration,
+  ts.SyntaxKind.PropertySignature,
+  ts.SyntaxKind.VariableDeclaration,
+  ts.SyntaxKind.TypeAliasDeclaration,
+  ts.SyntaxKind.ModuleDeclaration,
+  ts.SyntaxKind.Parameter,
+  ts.SyntaxKind.BindingElement,
+  ts.SyntaxKind.TypeParameter
+]);
+
+/** The Sourcetrail kind of a declaration, or undefined when the declaration is not indexed as a symbol. */
+function symbolKindOf(decl: ts.Node): number | undefined {
+  switch (decl.kind) {
+    case ts.SyntaxKind.ClassDeclaration:
+      return SymbolKind.CLASS;
+    case ts.SyntaxKind.InterfaceDeclaration:
+      return SymbolKind.INTERFACE;
+    case ts.SyntaxKind.TypeAliasDeclaration:
+      return SymbolKind.TYPEDEF;
+    case ts.SyntaxKind.EnumDeclaration:
+      return SymbolKind.ENUM;
+    case ts.SyntaxKind.EnumMember:
+      return SymbolKind.ENUM_CONSTANT;
+    case ts.SyntaxKind.ModuleDeclaration:
+      return SymbolKind.NAMESPACE;
+    case ts.SyntaxKind.FunctionDeclaration:
+      return SymbolKind.FUNCTION;
+    case ts.SyntaxKind.MethodDeclaration:
+    case ts.SyntaxKind.MethodSignature:
+    case ts.SyntaxKind.Constructor:
+      return SymbolKind.METHOD;
+    case ts.SyntaxKind.GetAccessor:
+    case ts.SyntaxKind.SetAccessor:
+    case ts.SyntaxKind.PropertySignature:
+      return SymbolKind.FIELD;
+    case ts.SyntaxKind.PropertyDeclaration:
+      return isFunctionValue((decl as ts.PropertyDeclaration).initializer)
+        ? SymbolKind.METHOD
+        : SymbolKind.FIELD;
+    case ts.SyntaxKind.VariableDeclaration:
+      return isFunctionValue((decl as ts.VariableDeclaration).initializer)
+        ? SymbolKind.FUNCTION
+        : SymbolKind.GLOBAL_VARIABLE;
+  }
+  return undefined;
+}
+
+function isFunctionValue(init: ts.Expression | undefined): boolean {
+  return (
+    !!init && (ts.isArrowFunction(init) || ts.isFunctionExpression(init))
+  );
+}
+
+/** The name of a declaration as Sourcetrail sees it. Computed and destructuring names have none. */
+function declarationName(node: ts.Node): string | undefined {
+  if (node.kind === ts.SyntaxKind.Constructor) return "constructor";
+  if (!NAMED_DECLARATION_KINDS.has(node.kind)) return undefined;
+  const name = ts.getNameOfDeclaration(node as ts.Declaration);
+  if (
+    name &&
+    (ts.isIdentifier(name) ||
+      ts.isPrivateIdentifier(name) ||
+      ts.isStringLiteral(name) ||
+      ts.isNumericLiteral(name))
+  ) {
+    return name.text;
+  }
+  return undefined;
+}
+
+/** Whether a declaration sits in module or class scope, so it is a symbol other files can refer to. */
+function isIndexedDeclaration(decl: ts.Node): boolean {
+  if (symbolKindOf(decl) === undefined || declarationName(decl) === undefined) {
+    return false;
+  }
+  if (ts.isVariableDeclaration(decl)) {
+    return isIndexedScope(decl.parent.parent.parent);
+  }
+  return isIndexedScope(decl.parent);
+}
+
+function isIndexedScope(container: ts.Node): boolean {
+  if (ts.isSourceFile(container)) return true;
+  if (ts.isModuleBlock(container)) return isIndexedDeclaration(container.parent);
+  if (
+    ts.isClassDeclaration(container) ||
+    ts.isInterfaceDeclaration(container) ||
+    ts.isEnumDeclaration(container)
+  ) {
+    return isIndexedDeclaration(container);
+  }
+  return false;
+}
+
+/** The names from the outermost declaration down to this one, e.g. ["BudgetTab", "toggleGroup"]. */
+function nameChain(decl: ts.Node): string[] {
+  const names: string[] = [];
+  for (let n: ts.Node | undefined = decl; n && !ts.isSourceFile(n); n = n.parent) {
+    const name = declarationName(n);
+    if (name !== undefined) names.unshift(name);
+  }
+  return names;
+}
+
+/** Nodes whose body is the context for the references inside them (the "caller" of an edge). */
+function ownsContext(node: ts.Node): boolean {
+  switch (node.kind) {
+    case ts.SyntaxKind.ClassDeclaration:
+    case ts.SyntaxKind.FunctionDeclaration:
+    case ts.SyntaxKind.MethodDeclaration:
+    case ts.SyntaxKind.Constructor:
+    case ts.SyntaxKind.GetAccessor:
+    case ts.SyntaxKind.SetAccessor:
+      return true;
+    case ts.SyntaxKind.PropertyDeclaration:
+      return !!(node as ts.PropertyDeclaration).initializer;
+    case ts.SyntaxKind.VariableDeclaration:
+      return isFunctionValue((node as ts.VariableDeclaration).initializer);
+  }
+  return false;
+}
+
+/** Lowercase JSX tags such as `div` are HTML elements, not components. */
+function isIntrinsicJsxTag(name: ts.JsxTagNameExpression): boolean {
+  return ts.isIdentifier(name) && /^[a-z]/.test(name.text);
+}
+
+/** The deepest directory that contains every file, e.g. `/p/src` for `/p/src/a/x.ts` and `/p/src/y.ts`. */
+function commonDirectory(files: readonly string[]): string {
+  if (files.length === 0) return ts.sys.getCurrentDirectory();
+  let common = path.dirname(files[0]).split(path.sep);
+  for (const file of files.slice(1)) {
+    const dir = path.dirname(file).split(path.sep);
+    let i = 0;
+    while (i < common.length && i < dir.length && common[i] === dir[i]) i++;
+    common = common.slice(0, i);
+  }
+  return common.join(path.sep) || path.sep;
+}
+
 export class Indexing {
   private fileIds = new Map<string, FileBuilder>();
   private program: ts.Program;
+  private checker: ts.TypeChecker;
   private host: ts.CompilerHost;
   private diagnostics: readonly ts.Diagnostic[];
+  private projectDirectory: string;
+  private writer!: SourcetrailDB;
+  /** One Sourcetrail symbol per declaration node, so definitions and references share it. */
+  private symbols = new Map<ts.Node, SymbolBuilder>();
+  /** Enclosing symbols while walking a file. The bottom entry is the file's module symbol. */
+  private contextStack: SymbolBuilder[] = [];
+  private recordedCommentPositions = new Set<string>();
   public static verbose: boolean;
 
   private constructor(config: ts.ParsedCommandLine) {
@@ -180,7 +346,10 @@ export class Indexing {
       configFileParsingDiagnostics: ts.getConfigFileParsingDiagnostics(config)
     };
     this.program = ts.createProgram(programOptions);
+    this.checker = this.program.getTypeChecker();
     this.diagnostics = ts.getPreEmitDiagnostics(this.program);
+    // Names are relative to the indexed files' common directory, so they do not depend on where the index is written.
+    this.projectDirectory = commonDirectory(fileNames);
   }
 
   private addOrGetFile(
@@ -195,6 +364,25 @@ export class Indexing {
     fileId = writer.createFile(file.fileName).asLanguage("typescript");
     this.fileIds.set(file.fileName, fileId);
     return fileId;
+  }
+
+  /** Declaration files and files from node_modules are referenced, but their definitions are not indexed. */
+  private isExternal(sf: ts.SourceFile): boolean {
+    return (
+      sf.isDeclarationFile ||
+      this.program.isSourceFileFromExternalLibrary(sf) ||
+      sf.fileName.split(path.sep).includes("node_modules")
+    );
+  }
+
+  private fileNameParts(sf: ts.SourceFile): string[] {
+    const parts = path.relative(this.projectDirectory, sf.fileName).split(path.sep);
+    // Dependencies outside the indexed directory are named from their node_modules folder, e.g. node_modules/preact/...
+    const nodeModulesAt = sf.fileName.split(path.sep).lastIndexOf("node_modules");
+    if (parts.includes("..") && nodeModulesAt >= 0) {
+      return sf.fileName.split(path.sep).slice(nodeModulesAt).filter(part => part.length > 0);
+    }
+    return parts.filter(part => part.length > 0);
   }
 
   private addDiagnostics(writer: SourcetrailDB) {
@@ -223,318 +411,167 @@ export class Indexing {
     });
   }
 
-  // TODO: Rename and rewrite these to traverse and map to Sourcetrail symbols, etc.
-  // Use https://github.com/CoatiSoftware/SourcetrailPythonIndexer/blob/master/indexer.py as an example
-  private visitTypeNodes(
-    writer: SourcetrailDB,
-    file: FileBuilder,
-    node: ts.Node
-  ): void {
-    const sf = node.getSourceFile();
-    recordAtomicSourceRangesForMultilineComments(writer, file, sf, node);
-
-    switch (node.kind) {
-      case ts.SyntaxKind.Constructor:
-        // Get parameter properties, and treat them as being on the *same* level as the constructor, not under it.
-        const ctr = <ts.ConstructorDeclaration>node;
-        //temp:debugger;
-        //addNodeWithRecursiveChild(ctr, ctr.body);
-
-        // Parameter properties are children of the class, not the constructor.
-        for (const param of ctr.parameters) {
-          if (ts.isParameterPropertyDeclaration(param, ctr)) {
-            //temp:debugger;
-            //addLeafNode(param);
-          }
-        }
-        break;
-
-      case ts.SyntaxKind.MethodDeclaration:
-      case ts.SyntaxKind.GetAccessor:
-      case ts.SyntaxKind.SetAccessor:
-      case ts.SyntaxKind.MethodSignature:
-        const n = node as
-          | ts.MethodDeclaration
-          | ts.GetAccessorDeclaration
-          | ts.SetAccessorDeclaration
-          | ts.MethodSignature;
-        const names: string[] = [];
-        for (
-          let s: ts.Symbol = (n as any).symbol;
-          s !== undefined;
-          s = (s as any).parent as ts.Symbol
-        ) {
-          names.unshift(s.name);
-        }
-        writer
-          .createSymbol(".", names)
-          .explicitly()
-          .ofType(SymbolKind.FIELD)
-          .atLocation(nodeToSourceRange(n.name, file))
-          .withSignature(nodeToSourceRange(n, file));
-        // if (!ts.hasDynamicName(<ts.ClassElement | ts.TypeElement>node)) {
-        //   addNodeWithRecursiveChild(
-        //     node,
-        //     (<ts.FunctionLikeDeclaration>node).body
-        //   );
-        // }
-        break;
-
-      case ts.SyntaxKind.PropertyDeclaration:
-      case ts.SyntaxKind.PropertySignature:
-        //temp:debugger;
-        // if (!ts.hasDynamicName(<ts.ClassElement | ts.TypeElement>node)) {
-        //   addLeafNode(node);
-        // }
-        break;
-
-      case ts.SyntaxKind.ImportClause:
-        const importClause = <ts.ImportClause>node;
-        // Handle default import case e.g.:
-        //    import d from "mod";
-        if (importClause.name) {
-          //temp:debugger;
-          // addLeafNode(importClause.name);
-        }
-
-        // Handle named bindings in imports e.g.:
-        //    import * as NS from "mod";
-        //    import {a, b as B} from "mod";
-        const { namedBindings } = importClause;
-        if (namedBindings) {
-          if (namedBindings.kind === ts.SyntaxKind.NamespaceImport) {
-            //temp:debugger;
-            // addLeafNode(namedBindings);
-          } else {
-            for (const element of namedBindings.elements) {
-              //temp:debugger;
-              // addLeafNode(element);
-            }
-          }
-        }
-        break;
-
-      case ts.SyntaxKind.ShorthandPropertyAssignment:
-        //temp:debugger;
-        // addNodeWithRecursiveChild(
-        //   node,
-        //   (<ts.ShorthandPropertyAssignment>node).name
-        // );
-        break;
-      case ts.SyntaxKind.SpreadAssignment:
-        const { expression } = <ts.SpreadAssignment>node;
-        //temp:debugger;
-        // Use the expression as the name of the SpreadAssignment, otherwise show as <unknown>.
-        // ts.isIdentifier(expression)
-        //   ? addLeafNode(node, expression)
-        //   : addLeafNode(node);
-        break;
-      case ts.SyntaxKind.BindingElement:
-      case ts.SyntaxKind.PropertyAssignment:
-      case ts.SyntaxKind.VariableDeclaration:
-        const { name, initializer } = node as
-          | ts.VariableDeclaration
-          | ts.PropertyAssignment
-          | ts.BindingElement;
-        // if (ts.isBindingPattern(name)) {
-        //   addChildrenRecursively(name);
-        // } else if (
-        //   initializer &&
-        //   ts.isFunctionOrClassExpression(initializer)
-        // ) {
-        //   // Add a node for the VariableDeclaration, but not for the initializer.
-        //   // startNode(node);
-        //   // forEachChild(initializer, addChildrenRecursively);
-        //   // endNode();
-        // } else {
-        //   // addNodeWithRecursiveChild(node, initializer);
-        // }
-        if (node.flags & (1 << 23)) {
-          // 1 << 23 internally documented as "ambient" or global.
-          writer
-            .createSymbol(".", name.getText(sf))
-            .explicitly()
-            .ofType(SymbolKind.GLOBAL_VARIABLE)
-            .atLocation(nodeToSourceRange(name, file))
-            .withSignature(nodeToSourceRange(node.parent, file));
-        } else {
-          //temp:debugger;
-        }
-        break;
-
-      case ts.SyntaxKind.FunctionDeclaration:
-        const nameNode = (<ts.FunctionLikeDeclaration>node).name;
-        // If we see a function declaration track as a possible ES5 class
-        if (nameNode && ts.isIdentifier(nameNode)) {
-          if (node.flags & (1 << 23)) {
-            // 1 << 23 internally documented as "ambient" or global.
-            writer
-              .createSymbol(".", nameNode.getText(sf))
-              .explicitly()
-              .ofType(SymbolKind.GLOBAL_VARIABLE)
-              .atLocation(nodeToSourceRange(nameNode, file))
-              .withSignature(nodeToSourceRange(node.parent, file));
-          } else {
-            //temp:debugger;
-          }
-          // addTrackedEs5Class(nameNode.text);
-        } else {
-          //temp:debugger;
-        }
-        // addNodeWithRecursiveChild(
-        //   node,
-        //   (<ts.FunctionLikeDeclaration>node).body
-        // );
-        break;
-      case ts.SyntaxKind.ArrowFunction:
-      case ts.SyntaxKind.FunctionExpression:
-        //temp:debugger;
-        /*addNodeWithRecursiveChild(
-              node,
-              (<ts.FunctionLikeDeclaration>node).body
-            );*/
-        break;
-
-      case ts.SyntaxKind.EnumDeclaration:
-        //startNode(node);
-        for (const member of (<ts.EnumDeclaration>node).members) {
-          //temp:debugger;
-          /*if (!ts.isComputedProperty(member)) {
-                //addLeafNode(member);
-              }*/
-        }
-        //endNode();
-        break;
-
-      case ts.SyntaxKind.ClassDeclaration:
-      case ts.SyntaxKind.InterfaceDeclaration:
-        //startNode(node);
-        let symbol;
-        if (node.flags & (1 << 23)) {
-          // 1 << 23 internally documented as "ambient" or global.
-          const name = (<ts.InterfaceDeclaration | ts.ClassDeclaration>node)
-            .name;
-          symbol = writer
-            .createSymbol(".", name.getText(sf))
-            .explicitly()
-            .ofType(SymbolKind.GLOBAL_VARIABLE)
-            .atLocation(nodeToSourceRange(name, file));
-        } else {
-          //temp:debugger;
-        }
-        // for (const member of (<ts.InterfaceDeclaration>node).members) {
-        //   //addChildrenRecursively(member);
-        //   symbol
-        //     .createChildSymbol(member.name.getText(sf))
-        //     .explicitly()
-        //     .ofType(SymbolKind.FIELD)
-        //     .atLocation(nodeToSourceRange(member.name, file))
-        //     .withSignature(nodeToSourceRange(member, file));
-        // }
-        //endNode();
-        break;
-      case ts.SyntaxKind.ClassExpression:
-        //temp:debugger;
-        break;
-
-      case ts.SyntaxKind.ModuleDeclaration:
-        //temp:debugger;
-        // addNodeWithRecursiveChild(
-        //   node,
-        //   getInteriorModule(<ts.ModuleDeclaration>node).body
-        // );
-        break;
-
-      case ts.SyntaxKind.ExportSpecifier:
-      case ts.SyntaxKind.ImportEqualsDeclaration:
-      case ts.SyntaxKind.IndexSignature:
-      case ts.SyntaxKind.CallSignature:
-      case ts.SyntaxKind.ConstructSignature:
-        //temp:debugger;
-        //addLeafNode(node);
-        break;
-
-      case ts.SyntaxKind.TypeAliasDeclaration:
-        const typeAlias = node as ts.TypeAliasDeclaration;
-        if (typeAlias.flags & (1 << 23)) {
-          const typeName = writer
-            .createSymbol(".", typeAlias.name.getText(sf))
-            .explicitly()
-            .ofType(SymbolKind.GLOBAL_VARIABLE)
-            .atLocation(nodeToSourceRange(typeAlias.name, file))
-            .withSignature(nodeToSourceRange(typeAlias, file));
-          writer
-            .createSymbol(".", typeAlias.type.getText(sf))
-            .explicitly()
-            .ofType(SymbolKind.TYPEDEF)
-            .atLocation(nodeToSourceRange(typeAlias.type, file))
-            .isReferencedBy(typeName, ReferenceKind.USAGE);
-        } else {
-          //temp:debugger;
-        }
-        //addLeafNode(node);
-        break;
-
-      case ts.SyntaxKind.CallExpression:
-      case ts.SyntaxKind.BinaryExpression:
-        //temp:debugger;
-        // const special = ts.getAssignmentDeclarationKind(
-        //   node as ts.BinaryExpression
-        // );
-        break;
-    }
-    ts.forEachChild(node, n => this.visitTypeNodes(writer, file, n));
-  }
-
-  private processSourceFile(
-    writer: SourcetrailDB,
-    file: FileBuilder,
-    sf: ts.SourceFile
-  ) {
-    sf.libReferenceDirectives.forEach(ref => {
-      const refSourceFile: ts.SourceFile = (this
-        .program as any).getLibFileFromReference(ref);
-      this.addOrGetFile(writer, refSourceFile);
-      const refFileSymbol = this.sourceFileToModuleSymbol(
-        writer,
-        refSourceFile,
-        file
-      );
-      writer
-        .createSymbol(`<reference lib="${ref.fileName}" />`)
-        .explicitly()
-        .ofType(SymbolKind.MACRO)
-        .atLocation(libReferenceToSourceRange(ref, sf, file))
-        .isReferencedBy(refFileSymbol, ReferenceKind.INCLUDE)
-        .atLocation(libReferenceToSourceRange(ref, sf, file));
-      // TODO: Use @internal pragmas or comment parsing to assign location start/end
-    });
-  }
-
-  private sourceFileToModuleSymbol(
-    writer: SourcetrailDB,
-    sf: ts.SourceFile,
-    sfFile: FileBuilder
-  ) {
-    const filenameParts = path
-      .relative(this.program.getCurrentDirectory(), sf.fileName)
-      .split(path.sep);
-    const symbol = writer
-      .createSymbol("/", filenameParts)
+  private moduleSymbol(sf: ts.SourceFile, file: FileBuilder): SymbolBuilder {
+    return this.writer
+      .createSymbol(NAME_DELIMITER, this.fileNameParts(sf))
       .explicitly()
       .ofType(SymbolKind.MODULE)
-      .withScope(nodeToSourceRange(sf, sfFile));
-    for (let i = 0; i < filenameParts.length; i++) {
-      if (filenameParts[i] === "node_modules") {
-        writer
-          .createSymbol("/", filenameParts.slice(i, i + 2))
-          .explicitly()
-          .ofType(SymbolKind.PACKAGE)
-          .withScope(nodeToSourceRange(sf, sfFile))
-          .isReferencedBy(symbol, ReferenceKind.INCLUDE);
-      }
+      .withScope(nodeToSourceRange(sf, file));
+  }
+
+  /**
+   * The Sourcetrail symbol for a declaration. For a declaration in an indexed file this also records its
+   * definition, once. Returns undefined for declarations that are not symbols (locals, parameters).
+   */
+  private symbolFor(decl: ts.Node): SymbolBuilder | undefined {
+    const cached = this.symbols.get(decl);
+    if (cached) return cached;
+
+    const sf = decl.getSourceFile();
+    const external = this.isExternal(sf);
+    if (!external && !isIndexedDeclaration(decl)) return undefined;
+
+    const names = [...this.fileNameParts(sf), ...nameChain(decl)];
+    const symbol = this.writer.createSymbol(NAME_DELIMITER, names);
+    this.symbols.set(decl, symbol);
+
+    const kind = symbolKindOf(decl);
+    if (kind !== undefined) {
+      symbol.ofType(kind);
+    }
+    if (!external) {
+      const file = this.addOrGetFile(this.writer, sf);
+      const nameNode = ts.getNameOfDeclaration(decl as ts.Declaration) ?? decl;
+      symbol
+        .explicitly()
+        .atLocation(nodeToSourceRange(nameNode, file))
+        .withSignature(nodeToSourceRange(decl, file));
     }
     return symbol;
+  }
+
+  /** The declaration an identifier refers to, following imports and re-exports through barrel files. */
+  private resolve(id: ts.Identifier): ts.Declaration | undefined {
+    const parent = id.parent;
+    let symbol: ts.Symbol | undefined =
+      ts.isShorthandPropertyAssignment(parent) && parent.name === id
+        ? this.checker.getShorthandAssignmentValueSymbol(parent)
+        : this.checker.getSymbolAtLocation(id);
+    while (symbol && symbol.flags & ts.SymbolFlags.Alias) {
+      symbol = this.checker.getAliasedSymbol(symbol);
+    }
+    const declarations = symbol?.declarations;
+    if (!declarations || declarations.length === 0) return undefined;
+    return (
+      declarations.find(d => !this.isExternal(d.getSourceFile())) ??
+      declarations[0]
+    );
+  }
+
+  /** The reference kind of an identifier, or undefined when the identifier is not a reference. */
+  private referenceKindOf(id: ts.Identifier): number | undefined {
+    const parent = id.parent;
+    if (
+      ts.isImportSpecifier(parent) ||
+      ts.isImportClause(parent) ||
+      ts.isNamespaceImport(parent)
+    ) {
+      return ReferenceKind.IMPORT;
+    }
+    if (ts.isExportSpecifier(parent) || ts.isJsxAttribute(parent)) {
+      return undefined;
+    }
+    if (ts.isPropertyAssignment(parent) && parent.name === id) {
+      return undefined;
+    }
+    if (
+      NAMED_DECLARATION_KINDS.has(parent.kind) &&
+      ts.getNameOfDeclaration(parent as ts.Declaration) === id
+    ) {
+      return undefined;
+    }
+    if (
+      ts.isExpressionWithTypeArguments(parent) &&
+      ts.isHeritageClause(parent.parent)
+    ) {
+      return ReferenceKind.INHERITANCE;
+    }
+    if (
+      ts.isTypeReferenceNode(parent) ||
+      (ts.isQualifiedName(parent) && ts.isTypeReferenceNode(parent.parent))
+    ) {
+      return ReferenceKind.TYPE_USAGE;
+    }
+    if (
+      ((ts.isCallExpression(parent) || ts.isNewExpression(parent)) &&
+        parent.expression === id) ||
+      (ts.isPropertyAccessExpression(parent) &&
+        parent.name === id &&
+        ts.isCallExpression(parent.parent) &&
+        parent.parent.expression === parent)
+    ) {
+      return ReferenceKind.CALL;
+    }
+    return ReferenceKind.USAGE;
+  }
+
+  private recordIdentifier(id: ts.Identifier, file: FileBuilder) {
+    const kind = this.referenceKindOf(id);
+    if (kind === undefined) return;
+
+    const parent = id.parent;
+    const isJsxTag =
+      (ts.isJsxOpeningElement(parent) || ts.isJsxSelfClosingElement(parent)) &&
+      parent.tagName === id;
+    if (isJsxTag && isIntrinsicJsxTag(id)) return;
+
+    const context = this.contextStack[this.contextStack.length - 1];
+    const location = nodeToSourceRange(id, file);
+    const decl = this.resolve(id);
+    if (!decl) {
+      // Only calls and JSX components are worth showing as unsolved. Other unresolved names are usually
+      // globals or dynamic code.
+      if (kind === ReferenceKind.CALL || isJsxTag) {
+        this.writer.createUnsolvedReference(context, kind, location);
+      }
+      return;
+    }
+
+    // References to TypeScript's built-in library (Math, Map, Promise) would only add noise to the graph.
+    if (this.program.isSourceFileDefaultLibrary(decl.getSourceFile())) return;
+
+    const target = this.symbolFor(decl);
+    if (!target) return;
+    this.writer.createReference(context, target, kind).atLocation(location);
+  }
+
+  private visitNode(node: ts.Node, sf: ts.SourceFile, file: FileBuilder): void {
+    // Leading comments are shared by every node that starts at the same position, so record them once.
+    const commentKey = `${sf.fileName}:${node.pos}`;
+    if (!this.recordedCommentPositions.has(commentKey)) {
+      this.recordedCommentPositions.add(commentKey);
+      recordAtomicSourceRangesForMultilineComments(this.writer, file, sf, node);
+    }
+
+    if (isIndexedDeclaration(node)) {
+      this.symbolFor(node);
+    }
+
+    if (ts.isIdentifier(node)) {
+      this.recordIdentifier(node, file);
+    }
+
+    const pushesContext = ownsContext(node) ? this.symbolFor(node) : undefined;
+    if (pushesContext) this.contextStack.push(pushesContext);
+    ts.forEachChild(node, child => this.visitNode(child, sf, file));
+    if (pushesContext) this.contextStack.pop();
+  }
+
+  private indexSourceFile(sf: ts.SourceFile) {
+    const file = this.addOrGetFile(this.writer, sf);
+    this.contextStack = [this.moduleSymbol(sf, file)];
+    this.visitNode(sf, sf, file);
+    this.contextStack = [];
   }
 
   static IndexFile(
@@ -613,14 +650,49 @@ export class Indexing {
     SourcetrailDB.open(
       databaseFilePath,
       writer => {
+        indexer.writer = writer;
         indexer.addDiagnostics(writer);
-        indexer.program.getSourceFiles().forEach(sf => {
-          const file = indexer.addOrGetFile(writer, sf);
-          indexer.processSourceFile(writer, file, sf);
-          indexer.visitTypeNodes(writer, file, sf);
-        });
+        indexer.program
+          .getSourceFiles()
+          .filter(sf => !indexer.isExternal(sf))
+          .forEach(sf => indexer.indexSourceFile(sf));
       },
       clear
     );
+    writeProjectSettings(databaseFilePath);
+  }
+}
+
+/**
+ * Makes the `.srctrlprj` beside the database match the database's stored project settings, so Sourcetrail opens
+ * the pair without asking to reindex.
+ *
+ * The SourcetrailDB writer creates a minimal `.srctrlprj` (version 0, no source groups) when the database is
+ * opened. That file is replaced with the default settings. A project file that has source groups belongs to the
+ * user and is kept as it is.
+ */
+function writeProjectSettings(databaseFilePath: string): void {
+  const projectFilePath = databaseFilePath.replace(/\.srctrldb$/, ".srctrlprj");
+  if (projectFilePath === databaseFilePath) {
+    return;
+  }
+  const existing = fs.existsSync(projectFilePath)
+    ? fs.readFileSync(projectFilePath, "utf8")
+    : undefined;
+  const settingsText =
+    existing !== undefined && existing.includes("<source_groups>")
+      ? existing
+      : DEFAULT_PROJECT_SETTINGS;
+  if (settingsText !== existing) {
+    fs.writeFileSync(projectFilePath, settingsText);
+  }
+  const db = new DatabaseSync(databaseFilePath);
+  try {
+    db.exec("BEGIN");
+    db.prepare("DELETE FROM meta WHERE key = 'project_settings'").run();
+    db.prepare("INSERT INTO meta (key, value) VALUES ('project_settings', ?)").run(settingsText);
+    db.exec("COMMIT");
+  } finally {
+    db.close();
   }
 }

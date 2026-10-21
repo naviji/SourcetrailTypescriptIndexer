@@ -12,12 +12,12 @@
     "sourcetraildb": "file:../sourcetraildb"
   },
   "devDependencies": {
-    "@types/node": "12.12.6",
+    "@types/node": "^22.20.5",
     "@typescript-eslint/eslint-plugin": "2.6.1",
     "@typescript-eslint/parser": "2.6.1",
     "eslint": "6.6.0",
     "ts-node": "^8.4.1",
-    "typescript": "^3.7.2"
+    "typescript": "^5.9.3"
   },
   "homepage": "https://github.com/LouisStAmour/SourcetrailTypescriptIndexer#readme",
   "license": "Apache-2.0",
